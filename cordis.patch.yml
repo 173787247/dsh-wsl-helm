@@ -1,0 +1,8 @@
+- insert:
+    - id: dsh-wsl-helm
+      name: dsh-wsl-helm
+      config:
+        enabled: true
+        timeoutMs: 30000
+        maxOutputChars: 60000
+        allowedContexts: []
