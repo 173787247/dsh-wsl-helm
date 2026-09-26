@@ -21,19 +21,38 @@ export function apply(ctx, config = {}) {
 
   ctx.tools.register({
     name: "helm_status_tool",
-    description: "Whether helm is on PATH; helm version.",
+    description: "Whether helm is on PATH; short version + env snippet (read-only).",
     parameters: { type: "object", additionalProperties: false, properties: {} },
-    output: { schema: { type: "object", additionalProperties: true }, render: (_a, v) => [{ type: "text", text: JSON.stringify(v) }] },
+    output: { schema: { type: "object", additionalProperties: true }, render: (_a, v) => [{ type: "text", text: JSON.stringify(v, null, 2) }] },
     timeoutMs: 10_000,
     isConcurrencySafe: () => true,
     async execute() {
       const bin = (await which("helm")) || null;
-      if (!bin) return { ok: true, helm: null };
+      if (!bin) return { ok: true, helm: null, allowedContexts };
       try {
         const r = await runHelm(["version", "--short"], { timeoutMs: 10_000 });
-        return { ok: true, helm: bin, version: r.stdout.trim(), allowedContexts };
+        let envSnippet = null;
+        try {
+          const env = await runHelm(["env"], { timeoutMs: 10_000, maxOut: 8_000 });
+          if (env.code === 0) {
+            envSnippet = env.stdout
+              .split("\n")
+              .filter((l) => /HELM_(NAMESPACE|DRIVER|REGISTRY|REPOSITORY)/i.test(l))
+              .slice(0, 12)
+              .join("\n");
+          }
+        } catch {
+          /* ignore */
+        }
+        return {
+          ok: true,
+          helm: bin,
+          version: r.stdout.trim(),
+          allowedContexts,
+          envSnippet: envSnippet || null,
+        };
       } catch (e) {
-        return { ok: true, helm: bin, error: e instanceof Error ? e.message : String(e) };
+        return { ok: true, helm: bin, allowedContexts, error: e instanceof Error ? e.message : String(e) };
       }
     },
     presentCall: () => ({ card: "generic", title: "helm tool" }),
@@ -76,19 +95,33 @@ export function apply(ctx, config = {}) {
     presentResult: (_a, r) => ({ card: "generic", title: "helm list", content: r.content }),
   });
 
-  ctx.tools.register({
-    name: "helm_release_status",
-    description: "helm status <release> (read-only).",
-    parameters: {
-      type: "object",
-      additionalProperties: false,
-      required: ["release"],
-      properties: {
-        release: { type: "string" },
-        namespace: { type: "string" },
-        context: { type: "string" },
-      },
+  async function executeReleaseStatus(args) {
+    const rel = String(args.release || "").trim();
+    if (!/^[A-Za-z0-9._-]+$/.test(rel)) throw new Error("invalid release name");
+    const ctxName = guardContext(args.context, allowedContexts);
+    const a = ["status", rel];
+    if (args.namespace) a.push("-n", String(args.namespace));
+    assertHelmArgs(a);
+    const r = await runHelm(a, { timeoutMs, maxOut: maxOutputChars, kubeContext: ctxName });
+    if (r.code !== 0) throw new Error(r.stderr || `exit ${r.code}`);
+    return { ok: true, release: rel, output: r.stdout, truncated: r.truncated };
+  }
+
+  const releaseStatusParams = {
+    type: "object",
+    additionalProperties: false,
+    required: ["release"],
+    properties: {
+      release: { type: "string" },
+      namespace: { type: "string" },
+      context: { type: "string" },
     },
+  };
+
+  ctx.tools.register({
+    name: "helm_status",
+    description: "helm status <release> (read-only release details).",
+    parameters: releaseStatusParams,
     output: {
       schema: { type: "object", additionalProperties: true },
       render: (_a, v) => [{ type: "text", text: v.ok === false ? v.error : v.output }],
@@ -97,15 +130,28 @@ export function apply(ctx, config = {}) {
     isConcurrencySafe: () => true,
     async execute(args) {
       try {
-        const rel = String(args.release || "").trim();
-        if (!/^[A-Za-z0-9._-]+$/.test(rel)) throw new Error("invalid release name");
-        const ctxName = guardContext(args.context, allowedContexts);
-        const a = ["status", rel];
-        if (args.namespace) a.push("-n", String(args.namespace));
-        assertHelmArgs(a);
-        const r = await runHelm(a, { timeoutMs, maxOut: maxOutputChars, kubeContext: ctxName });
-        if (r.code !== 0) throw new Error(r.stderr || `exit ${r.code}`);
-        return { ok: true, output: r.stdout, truncated: r.truncated };
+        return await executeReleaseStatus(args);
+      } catch (e) {
+        return { ok: false, error: e instanceof Error ? e.message : String(e) };
+      }
+    },
+    presentCall: () => ({ card: "generic", title: "helm status" }),
+    presentResult: (_a, r) => ({ card: "generic", title: "helm status", content: r.content }),
+  });
+
+  ctx.tools.register({
+    name: "helm_release_status",
+    description: "Alias of helm_status (read-only).",
+    parameters: releaseStatusParams,
+    output: {
+      schema: { type: "object", additionalProperties: true },
+      render: (_a, v) => [{ type: "text", text: v.ok === false ? v.error : v.output }],
+    },
+    timeoutMs,
+    isConcurrencySafe: () => true,
+    async execute(args) {
+      try {
+        return await executeReleaseStatus(args);
       } catch (e) {
         return { ok: false, error: e instanceof Error ? e.message : String(e) };
       }
